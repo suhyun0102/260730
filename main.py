@@ -230,64 +230,37 @@ st.plotly_chart(
     fig,
     use_container_width=True
 )
-
 # -----------------------------------------------------
-# 많은 지역 / 적은 지역
+# 광역자치단체별 중학생 수 최다 / 최소 시군구
 # -----------------------------------------------------
 
-left, right = st.columns(2)
+st.subheader("📊 광역자치단체별 중학생 수가 가장 많은 지역과 가장 적은 지역")
 
-with left:
+result = []
 
-    st.subheader("📈 학생 수가 많은 지역 TOP10")
+# 시도별로 반복
+for sido in sorted(map_df["시도_x"].unique()):
 
-    top10 = (
-        map_df.sort_values(
-            "학생수",
-            ascending=False
-        )[
-            ["시도_x", "시군구_x", "학생수"]
-        ]
-        .head(10)
-        .rename(
-            columns={
-                "시도_x": "시도",
-                "시군구_x": "시군구"
-            }
-        )
-    )
+    temp = map_df[map_df["시도_x"] == sido].copy()
 
-    st.dataframe(
-        top10,
-        use_container_width=True,
-        hide_index=True
-    )
+    # 학생수가 가장 많은 지역
+    max_row = temp.loc[temp["학생수"].idxmax()]
 
-with right:
+    # 학생수가 가장 적은 지역
+    min_row = temp.loc[temp["학생수"].idxmin()]
 
-    st.subheader("📉 학생 수가 적은 지역 TOP10")
+    result.append({
+        "광역자치단체": sido,
+        "가장 많은 지역": max_row["시군구_x"],
+        "학생수": f'{max_row["학생수"]:,}명',
+        "가장 적은 지역": min_row["시군구_x"],
+        "학생수 ": f'{min_row["학생수"]:,}명'   # 마지막 공백은 같은 이름 방지
+    })
 
-    bottom10 = (
-        map_df.sort_values(
-            "학생수"
-        )[
-            ["시도_x", "시군구_x", "학생수"]
-        ]
-        .head(10)
-        .rename(
-            columns={
-                "시도_x": "시도",
-                "시군구_x": "시군구"
-            }
-        )
-    )
+result_df = pd.DataFrame(result)
 
-    st.dataframe(
-        bottom10,
-        use_container_width=True,
-        hide_index=True
-    )
-
-st.caption(
-    f"기준 연도 : {latest_year}년"
+st.dataframe(
+    result_df,
+    use_container_width=True,
+    hide_index=True
 )
