@@ -49,10 +49,19 @@ c3.metric("누적 관객", f"{top['audiAcc']:,}명")
 
 # 표를 한국어 열 이름으로 정리
 table = df[["rank", "movieNm", "openDt", "audiCnt", "audiAcc", "scrnCnt"]].copy()
-table.columns = ["순위", "영화명", "개봉일", "관객수", "누적관객", "스크린수"]
-table = table.sort_values("순위").reset_index(drop=True)
 
-st.subheader("📋 박스오피스 TOP 10")
+# 개봉일을 날짜 형식으로 변환
+table["openDt"] = pd.to_datetime(table["openDt"], format="%Y%m%d", errors="coerce")
+
+table.columns = ["순위", "영화명", "개봉일", "관객수", "누적관객", "스크린수"]
+
+# 개봉일 순서로 정렬
+table = table.sort_values("개봉일").reset_index(drop=True)
+
+# 날짜 표시 형식 변경
+table["개봉일"] = table["개봉일"].dt.strftime("%Y-%m-%d")
+
+st.subheader("📋 박스오피스 TOP 10 (개봉일 순)")
 st.dataframe(table)
 
 st.subheader("📈 관객수 상위 5편")
