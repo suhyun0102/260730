@@ -2,10 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import gzip
+import io
 import json
 import plotly.express as px
-import geopandas as gpd
-from io import BytesIO
+import folium
+
+from streamlit_folium import st_folium
 
 
 # --------------------------------------------------
@@ -13,30 +16,30 @@ from io import BytesIO
 # --------------------------------------------------
 
 st.set_page_config(
-    page_title="전국 중학생 분포 지도",
+    page_title="전국 중학생 인구 지도",
     layout="wide"
 )
 
-st.title("🗺️ 전국 중학생(14~16세) 분포 지도")
-st.caption("최신 인구 데이터를 기준으로 시군구별 중학생 수를 표시합니다.")
+st.title("🗺️ 전국 시군구별 중학생(14~16세) 인구 지도")
+
+st.caption(
+    "최신 인구 데이터를 기준으로 전국 시군구별 중학생 수를 단계구분도로 표현합니다."
+)
 
 
 # --------------------------------------------------
 # 데이터 주소
 # --------------------------------------------------
 
-POP_URL = (
-    "https://raw.githubusercontent.com/"
-    "greatsong/modudata/main/data/"
-    "population_yearly.csv.gz"
+POPULATION_URL = (
+    "https://raw.githubusercontent.com/greatsong/modudata/"
+    "main/data/population_yearly.csv.gz"
 )
 
-GEO_URL = (
-    "https://raw.githubusercontent.com/"
-    "greatsong/modudata/main/data/"
-    "boundaries/sigungu_kr.geojson"
+GEOJSON_URL = (
+    "https://raw.githubusercontent.com/greatsong/modudata/"
+    "main/data/boundaries/sigungu_kr.geojson"
 )
-
 
 
 # --------------------------------------------------
@@ -46,106 +49,64 @@ GEO_URL = (
 @st.cache_data
 def load_population():
 
-    # 인구 데이터 읽기
+    # gzip CSV 다운로드
+    response = requests.get(POPULATION_URL)
+    response.raise_for_status()
+
+    # 압축 해제 후 읽기
     df = pd.read_csv(
-        POP_URL,
-        compression="gzip",
+        gzip.GzipFile(
+            fileobj=io.BytesIO(response.content)
+        ),
         dtype={
             "코드": str
         }
     )
 
-    # 코드가 숫자로 변환된 경우 대비
-    df["코드"] = (
-        df["코드"]
-        .astype(str)
-        .str.zfill(10)
-    )
-
-    return df
-
-
-
-@st.cache_data
-def load_boundary():
-
-    # GeoJSON 읽기
-    response = requests.get(GEO_URL)
-    geojson = response.json()
-
-    gdf = gpd.GeoDataFrame.from_features(
-        geojson["features"]
-    )
-
-    # 코드 역시 문자열 처리
-    gdf["코드"] = (
-        gdf["코드"]
-        .astype(str)
-        .str.zfill(5)
-    )
-
-    return gdf
-
-
-
-# --------------------------------------------------
-# 중학생 수 계산
-# --------------------------------------------------
-
-def make_middle_population(df):
+    # 코드가 숫자로 변환되는 문제 방지
+    df["코드"] = df["코드"].astype(str)
 
     # 최신 연도 선택
     latest_year = df["연도"].max()
 
-    df = df[
-        df["연도"] == latest_year
-    ].copy()
+    df = df[df["연도"] == latest_year].copy()
 
 
-    # 중학생 나이
-    ages = [14, 15, 16]
+    # --------------------------------------------------
+    # 중학생 = 만 14세~16세
+    # --------------------------------------------------
 
-
-    # 계_14세 + 계_15세 + 계_16세
-    middle_cols = [
-        f"계_{age}세"
-        for age in ages
+    age_columns = [
+        "계_14세",
+        "계_15세",
+        "계_16세"
     ]
 
+    for col in age_columns:
+        if col not in df.columns:
+            raise ValueError(
+                f"{col} 열을 찾을 수 없습니다."
+            )
 
-    # 혹시 열 이름 확인
-    missing = [
-        c for c in middle_cols
-        if c not in df.columns
-    ]
-
-    if missing:
-        st.error(
-            f"없는 열이 있습니다: {missing}"
-        )
-        st.stop()
-
-
-    # 읍면동별 중학생 계산
     df["중학생수"] = (
-        df[middle_cols]
-        .sum(axis=1)
+        df["계_14세"]
+        + df["계_15세"]
+        + df["계_16세"]
     )
 
 
-    # 코드 앞 5자리 = 시군구 코드
+    # 읍면동 코드 앞 5자리 = 시군구 코드
     df["시군구코드"] = (
         df["코드"]
         .str[:5]
     )
 
 
-    # 시군구 단위 합계
+    # 시군구별 합계
     result = (
         df.groupby(
             [
-                "시군구코드",
-                "시도"
+                "시군구코드"
             ],
             as_index=False
         )
@@ -153,299 +114,368 @@ def make_middle_population(df):
         .sum()
     )
 
+    result["중학생수"] = (
+        result["중학생수"]
+        .astype(int)
+    )
+
 
     return result, latest_year
 
 
 
-# --------------------------------------------------
-# 단계 구간 만들기
-# --------------------------------------------------
+@st.cache_data
+def load_geojson():
 
-def make_grade(value, minimum, maximum):
+    response = requests.get(GEOJSON_URL)
+    response.raise_for_status()
 
-    if maximum == minimum:
-        return 1
+    geo = response.json()
 
-    step = (
-        maximum - minimum
-    ) / 5
+    # 코드가 숫자로 읽힌 경우 문자열 변환
+    for feature in geo["features"]:
 
-    grade = int(
-        (value - minimum)
-        / step
-    ) + 1
+        code = feature["properties"]["코드"]
 
-    if grade > 5:
-        grade = 5
+        feature["properties"]["코드"] = str(code).zfill(5)
 
-    return grade
+    return geo
 
 
 
 # --------------------------------------------------
-# 실행
+# 데이터 실행
 # --------------------------------------------------
 
-with st.spinner("데이터를 불러오는 중입니다..."):
+try:
 
-    population = load_population()
+    population, year = load_population()
+    geojson = load_geojson()
 
-    boundary = load_boundary()
+except Exception as e:
 
-    middle, year = make_middle_population(
-        population
+    st.error(
+        f"데이터를 불러오는 과정에서 오류가 발생했습니다.\n\n{e}"
+    )
+
+    st.stop()
+
+
+
+# --------------------------------------------------
+# 지도 데이터와 결합
+# --------------------------------------------------
+
+geo_codes = []
+
+for f in geojson["features"]:
+
+    geo_codes.append(
+        f["properties"]["코드"]
     )
 
 
-
-# --------------------------------------------------
-# 지도 데이터 연결
-# --------------------------------------------------
-
-map_df = boundary.merge(
-    middle,
-    left_on="코드",
-    right_on="시군구코드",
-    how="left"
-)
-
-
-# 인구 없는 지역 0 처리
-map_df["중학생수"] = (
-    map_df["중학생수"]
-    .fillna(0)
-)
-
-
-
-# --------------------------------------------------
-# 단계구분 등급 계산
-# --------------------------------------------------
-
-minimum = map_df["중학생수"].min()
-maximum = map_df["중학생수"].max()
-
-
-map_df["등급"] = map_df["중학생수"].apply(
-    lambda x:
-    make_grade(
-        x,
-        minimum,
-        maximum
-    )
-)
-
-
-
-# --------------------------------------------------
-# 범례용 문구 만들기
-# --------------------------------------------------
-
-step = (
-    maximum - minimum
-) / 5
-
-
-legend_labels = {}
-
-for i in range(1,6):
-
-    low = int(
-        minimum + step*(i-1)
-    )
-
-    high = int(
-        minimum + step*i
-    )
-
-    legend_labels[i] = (
-        f"{low:,}명 ~ {high:,}명"
-    )
-
-
-
-map_df["구간"] = (
-    map_df["등급"]
-    .map(legend_labels)
-)
-
-
-
-# --------------------------------------------------
-# 지도 그리기
-# --------------------------------------------------
-
-st.subheader(
-    f"📌 {year}년 기준 시군구별 중학생 수"
-)
-
-
-fig = px.choropleth_map(
-    map_df,
-    geojson=map_df.geometry,
-    locations=map_df.index,
-    color="등급",
-    hover_name="시군구",
-    hover_data={
-        "시도": True,
-        "중학생수": ":,",
-        "등급": False
-    },
-    color_continuous_scale=[
-        "#edf8fb",
-        "#b2e2e2",
-        "#66c2a4",
-        "#238b45",
-        "#005824"
-    ],
-    range_color=[
-        1,
-        5
-    ],
-    labels={
-        "등급": "단계"
+geo_df = pd.DataFrame(
+    {
+        "시군구코드": geo_codes
     }
 )
 
 
-fig.update_geos(
-    fitbounds="locations",
-    visible=False
-)
-
-
-fig.update_layout(
-    height=700,
-    margin={
-        "r":0,
-        "t":0,
-        "l":0,
-        "b":0
-    },
-    coloraxis_colorbar=dict(
-        title="중학생 수",
-        tickvals=[
-            1,2,3,4,5
-        ],
-        ticktext=[
-            legend_labels[i]
-            for i in range(1,6)
-        ]
+# 코드 기준 결합
+map_df = (
+    geo_df
+    .merge(
+        population,
+        on="시군구코드",
+        how="left"
     )
 )
 
 
-st.plotly_chart(
-    fig,
-    use_container_width=True
+# 혹시 누락 지역이 있으면 0 처리
+map_df["중학생수"] = (
+    map_df["중학생수"]
+    .fillna(0)
+    .astype(int)
 )
+
+
+# --------------------------------------------------
+# 5단계 구간 만들기
+# --------------------------------------------------
+
+minimum = int(
+    map_df["중학생수"].min()
+)
+
+maximum = int(
+    map_df["중학생수"].max()
+)
+
+
+# 동일 간격 5등급
+bins = np.linspace(
+    minimum,
+    maximum,
+    6
+)
+
+
+labels = []
+
+for i in range(5):
+
+    start = int(np.floor(bins[i]))
+    end = int(np.ceil(bins[i+1]))
+
+    labels.append(
+        f"{start:,}명 ~ {end:,}명"
+    )
+
+
+map_df["등급"] = pd.cut(
+    map_df["중학생수"],
+    bins=bins,
+    labels=labels,
+    include_lowest=True
+)
+
+
+# --------------------------------------------------
+# GeoJSON에 학생수 정보 삽입
+# --------------------------------------------------
+
+value_dict = dict(
+    zip(
+        map_df["시군구코드"],
+        map_df["중학생수"]
+    )
+)
+
+
+for feature in geojson["features"]:
+
+    code = feature["properties"]["코드"]
+
+    value = value_dict.get(
+        code,
+        0
+    )
+
+    feature["properties"]["중학생수"] = value
 
 
 
 # --------------------------------------------------
-# 광역자치단체별 최대 / 최소 지역
+# 지도 생성
 # --------------------------------------------------
 
 st.subheader(
-    "📊 광역지방자치단체별 중학생 수 최대·최소 지역"
+    f"📍 {year}년 전국 시군구별 중학생 수"
 )
 
 
-max_region = (
-    middle.sort_values(
-        "중학생수",
-        ascending=False
-    )
-    .groupby(
-        "시도"
-    )
-    .first()
-    .reset_index()
+m = folium.Map(
+    location=[
+        36.5,
+        127.8
+    ],
+    zoom_start=7,
+    tiles=None
 )
 
 
-min_region = (
-    middle.sort_values(
-        "중학생수",
-        ascending=True
-    )
-    .groupby(
-        "시도"
-    )
-    .first()
-    .reset_index()
-)
+# 단계별 색상
+colors = [
+    "#edf8fb",
+    "#b3cde3",
+    "#8c96c6",
+    "#8856a7",
+    "#810f7c"
+]
+
+
+def get_color(value):
+
+    for i in range(5):
+
+        if value <= bins[i+1]:
+
+            return colors[i]
+
+    return colors[-1]
 
 
 
-summary = pd.DataFrame({
+# 지도 경계 추가
 
-    "시도":
-    max_region["시도"],
+for feature in geojson["features"]:
 
-    "중학생 수 가장 많은 시군구":
-    max_region["시군구코드"]
-    .map(
-        dict(
-            zip(
-                map_df["시군구코드"],
-                map_df["시군구"]
-            )
+    value = feature["properties"]["중학생수"]
+
+    folium.GeoJson(
+        feature,
+        style_function=lambda x,
+            value=value: {
+
+                "fillColor":
+                    get_color(value),
+
+                "color":
+                    "gray",
+
+                "weight":
+                    0.5,
+
+                "fillOpacity":
+                    0.8
+            },
+
+        tooltip=folium.GeoJsonTooltip(
+            fields=[
+                "시군구",
+                "시도",
+                "중학생수"
+            ],
+            aliases=[
+                "시군구",
+                "시도",
+                "중학생 수"
+            ],
+            localize=True
         )
-    ),
 
-    "최대 학생수":
-    max_region["중학생수"],
-
-
-    "중학생 수 가장 적은 시군구":
-    min_region["시군구코드"]
-    .map(
-        dict(
-            zip(
-                map_df["시군구코드"],
-                map_df["시군구"]
-            )
-        )
-    ),
-
-    "최소 학생수":
-    min_region["중학생수"]
-
-})
+    ).add_to(m)
 
 
 
-summary = summary.sort_values(
-    "시도"
+st_folium(
+    m,
+    width=1100,
+    height=650
 )
+
+
+
+# --------------------------------------------------
+# 범례 표시
+# --------------------------------------------------
+
+st.markdown("### 🎨 지도 범례")
+
+legend_df = pd.DataFrame(
+    {
+        "단계": [
+            "1단계",
+            "2단계",
+            "3단계",
+            "4단계",
+            "5단계"
+        ],
+        "범위": labels
+    }
+)
+
+st.table(
+    legend_df
+)
+
+
+
+# --------------------------------------------------
+# 광역지자체별 최대 / 최소 지역
+# --------------------------------------------------
+
+st.markdown(
+    "## 🏙️ 광역지방자치단체별 중학생 수 최대·최소 지역"
+)
+
+
+# GeoJSON 속성에서 시도 정보 가져오기
+
+geo_info = []
+
+for f in geojson["features"]:
+
+    geo_info.append(
+        {
+            "시군구코드":
+                f["properties"]["코드"],
+
+            "시군구":
+                f["properties"]["시군구"],
+
+            "시도":
+                f["properties"]["시도"]
+        }
+    )
+
+
+geo_info = pd.DataFrame(
+    geo_info
+)
+
+
+summary = (
+    map_df
+    .merge(
+        geo_info,
+        on="시군구코드",
+        how="left"
+    )
+)
+
+
+rows = []
+
+for sido, group in summary.groupby("시도"):
+
+    max_row = (
+        group
+        .sort_values(
+            "중학생수",
+            ascending=False
+        )
+        .iloc[0]
+    )
+
+
+    min_row = (
+        group
+        .sort_values(
+            "중학생수",
+            ascending=True
+        )
+        .iloc[0]
+    )
+
+
+    rows.append(
+        {
+            "시도":
+                sido,
+
+            "중학생 수 가장 많은 지역":
+                max_row["시군구"],
+
+            "학생수":
+                f'{max_row["중학생수"]:,}명',
+
+            "중학생 수 가장 적은 지역":
+                min_row["시군구"],
+
+            "학생수(최소)":
+                f'{min_row["중학생수"]:,}명'
+        }
+    )
+
+
+summary_table = pd.DataFrame(rows)
 
 
 st.dataframe(
-    summary,
+    summary_table,
     use_container_width=True,
     hide_index=True
 )
-
-
-
-# --------------------------------------------------
-# 데이터 확인용
-# --------------------------------------------------
-
-with st.expander(
-    "📁 데이터 확인"
-):
-
-    st.write(
-        f"사용 연도: {year}"
-    )
-
-    st.write(
-        f"전국 최대 중학생 수: {maximum:,.0f}명"
-    )
-
-    st.write(
-        f"전국 최소 중학생 수: {minimum:,.0f}명"
-    )
